@@ -541,7 +541,7 @@ async def scrape_website(request: Request, body: ScrapeRequest):
 # ============== ENDPOINT 2: AI QUALIFICATION ==============
 
 @app.post("/ai/qualify", response_model=AIQualifyResponse)
-@limiter.limit("300/minute")
+@limiter.limit("600/minute")
 async def ai_qualify(request: Request, body: AIQualifyRequest):
     """
     AI qualification using GPT-OSS (~1-2 seconds).
@@ -614,7 +614,7 @@ REASONING: [One sentence]"""
 # ============== ENDPOINT 3: AI PROCESSING ==============
 
 @app.post("/ai/process", response_model=AIProcessResponse)
-@limiter.limit("300/minute")
+@limiter.limit("600/minute")
 async def ai_process(request: Request, body: AIProcessRequest):
     """
     AI processing using GPT-OSS (~1-2 seconds).
@@ -685,7 +685,7 @@ def _parse_qualify_response(response: str, url: str) -> QualifyResponse:
 
 
 @app.post("/qualify", response_model=QualifyResponse)
-@limiter.limit("300/minute")
+@limiter.limit("600/minute")
 async def qualify_website(request: Request, body: QualifyRequest):
     """
     Website qualification using GPT-OSS (~1-2 seconds).
@@ -966,8 +966,8 @@ async def root():
         },
         "endpoints": {
             "POST /scrape": "Ultra-fast website scraper (2-5s)",
-            "POST /ai/qualify": "AI qualification via GPT-OSS (~1-2s, 300/min)",
-            "POST /ai/process": "General AI processing via GPT-OSS (~1-2s, 300/min)",
+            "POST /ai/qualify": "AI qualification via GPT-OSS (~1-2s, 600/min)",
+            "POST /ai/process": "General AI processing via GPT-OSS (~1-2s, 600/min)",
             "POST /research": "Full research with citations (10-30s)",
             "POST /email/verify": "Email verification via Reacher (5-30s)",
             "GET /health": "Check system health",
@@ -998,16 +998,15 @@ async def status():
             "num_keys": num_keys,
         },
         "rate_limits": {
-            "ai_qualify": "300/minute (5 req/sec)",
-            "ai_process": "300/minute (5 req/sec)",
+            "ai_qualify": "600/minute (10 req/sec)",
+            "ai_process": "600/minute (10 req/sec)",
             "scrape": "200/minute",
             "research": "10/second",
-            "note": "Groq Developer tier provides ~300 RPM per key (5 req/sec)",
+            "note": "Groq Developer tier provides ~300+ RPM per key",
         },
         "clay_compatibility": {
-            "clay_minimum": "5 requests/second (300/min)",
-            "status": "OK - use Groq Developer tier for 300+ RPM per key",
-            "recommendation": "Upgrade to Groq Developer tier at console.groq.com for 5 req/sec with a single key",
+            "clay_rate": "10 requests/second (600/min)",
+            "status": "OK - Groq Developer tier active",
         },
         "cost_per_enrichment": {
             "gpt_oss_20b": "~$0.000275 per record (~$275 per 1M records)",
