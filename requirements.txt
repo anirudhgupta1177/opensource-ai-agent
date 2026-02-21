@@ -29,6 +29,9 @@ slowapi>=0.1.9
 # Environment Management
 python-dotenv>=1.0.0
 
+# Email validation (required by Pydantic EmailStr)
+email-validator>=2.0.0
+
 # Token Counting (for accurate context management)
 tiktoken>=0.7.0
 
