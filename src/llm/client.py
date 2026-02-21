@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from openai import OpenAI
@@ -27,6 +28,80 @@ from src.utils.resilience import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# ChatResult: structured return type with usage & cost
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ChatResult:
+    """Result from an LLM chat call with token usage and cost."""
+    content: str
+    model: str
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    cost_usd: float
+    backend: str  # "groq", "ollama", "huggingface"
+
+
+# Groq pricing per 1M tokens: (input_price, output_price)
+MODEL_PRICING: dict[str, tuple[float, float]] = {
+    "openai/gpt-oss-20b": (0.075, 0.30),
+    "openai/gpt-oss-120b": (0.15, 0.60),
+    "llama-3.1-8b-instant": (0.05, 0.08),
+    "llama-3.3-70b-versatile": (0.59, 0.79),
+    "llama-3.1-70b-versatile": (0.59, 0.79),
+    "llama3-70b-8192": (0.59, 0.79),
+    "llama3-8b-8192": (0.05, 0.08),
+}
+
+
+def _calculate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    """Calculate cost in USD based on model pricing and token counts."""
+    pricing = MODEL_PRICING.get(model)
+    if not pricing:
+        # Partial match fallback
+        for key, prices in MODEL_PRICING.items():
+            if key in model or model in key:
+                pricing = prices
+                break
+    if not pricing:
+        return 0.0
+    input_price, output_price = pricing
+    return (prompt_tokens * input_price + completion_tokens * output_price) / 1_000_000
+
+
+# ---------------------------------------------------------------------------
+# Thread-local cost accumulator (for multi-call endpoints like /research)
+# ---------------------------------------------------------------------------
+
+_cost_tracker = threading.local()
+
+
+def start_cost_tracking() -> None:
+    """Start accumulating LLM costs for this thread."""
+    _cost_tracker.total_cost = 0.0
+    _cost_tracker.total_prompt_tokens = 0
+    _cost_tracker.total_completion_tokens = 0
+
+
+def get_accumulated_cost() -> dict[str, Any]:
+    """Return accumulated cost since last start_cost_tracking()."""
+    return {
+        "total_cost_usd": round(getattr(_cost_tracker, "total_cost", 0.0), 8),
+        "total_prompt_tokens": getattr(_cost_tracker, "total_prompt_tokens", 0),
+        "total_completion_tokens": getattr(_cost_tracker, "total_completion_tokens", 0),
+    }
+
+
+def _accumulate_cost(result: ChatResult) -> None:
+    """Add a ChatResult's cost to the thread-local accumulator."""
+    if hasattr(_cost_tracker, "total_cost"):
+        _cost_tracker.total_cost += result.cost_usd
+        _cost_tracker.total_prompt_tokens += result.prompt_tokens
+        _cost_tracker.total_completion_tokens += result.completion_tokens
 
 # Circuit breakers for each backend
 _groq_circuit_breaker: Optional[CircuitBreaker] = None
@@ -152,11 +227,12 @@ def _chat_with_groq(
     messages: list[dict[str, Any]],
     max_tokens: int,
     model: Optional[str] = None
-) -> str:
+) -> ChatResult:
     """
     Chat using Groq with automatic model fallback.
     Handles GPT-OSS reasoning models by adding token overhead
     and extracting content from reasoning responses.
+    Returns ChatResult with token usage and cost.
     """
     config = get_config()
     client = _make_groq_client()
@@ -186,7 +262,20 @@ def _chat_with_groq(
                 content = resp.choices[0].message.content
                 if content:
                     logger.info("Successfully used Groq model: %s", model_name)
-                    return content
+                    # Extract usage from response
+                    usage = resp.usage
+                    prompt_tokens = usage.prompt_tokens if usage else 0
+                    completion_tokens = usage.completion_tokens if usage else 0
+                    cost = _calculate_cost(model_name, prompt_tokens, completion_tokens)
+                    return ChatResult(
+                        content=content,
+                        model=model_name,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=prompt_tokens + completion_tokens,
+                        cost_usd=cost,
+                        backend="groq",
+                    )
             raise RuntimeError(f"Empty response from Groq model {model_name}")
         except Exception as e:
             last_error = e
@@ -200,10 +289,11 @@ def _chat_with_ollama(
     messages: list[dict[str, Any]],
     max_tokens: int,
     model: Optional[str] = None
-) -> str:
+) -> ChatResult:
     """
     Chat using Ollama with automatic model fallback.
     Tries each configured model in order until one works.
+    Local inference — cost is always $0.
     """
     config = get_config()
     client = _make_ollama_client()
@@ -223,7 +313,18 @@ def _chat_with_ollama(
                 content = resp.choices[0].message.content
                 if content:
                     logger.info("Successfully used Ollama model: %s", model_name)
-                    return content
+                    usage = resp.usage
+                    prompt_tokens = usage.prompt_tokens if usage else 0
+                    completion_tokens = usage.completion_tokens if usage else 0
+                    return ChatResult(
+                        content=content,
+                        model=model_name,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=prompt_tokens + completion_tokens,
+                        cost_usd=0.0,  # Local inference
+                        backend="ollama",
+                    )
             raise RuntimeError(f"Empty response from Ollama model {model_name}")
         except Exception as e:
             last_error = e
@@ -237,10 +338,10 @@ def _chat_with_hf(
     messages: list[dict[str, Any]],
     max_tokens: int,
     model: Optional[str] = None
-) -> str:
+) -> ChatResult:
     """
     Chat using HuggingFace Inference API with model fallback.
-    Uses free tier - may be rate limited.
+    Uses free tier — cost is $0.
     """
     config = get_config()
     client = _make_hf_client()
@@ -263,7 +364,18 @@ def _chat_with_hf(
                 content = resp.choices[0].message.content
                 if content:
                     logger.info("Successfully used HuggingFace model: %s", model_name)
-                    return content
+                    usage = resp.usage
+                    prompt_tokens = usage.prompt_tokens if usage else 0
+                    completion_tokens = usage.completion_tokens if usage else 0
+                    return ChatResult(
+                        content=content,
+                        model=model_name,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=prompt_tokens + completion_tokens,
+                        cost_usd=0.0,  # Free tier
+                        backend="huggingface",
+                    )
             raise RuntimeError(f"Empty response from HuggingFace model {model_name}")
         except Exception as e:
             last_error = e
@@ -278,7 +390,7 @@ def _groq_with_retry(
     messages: list[dict[str, Any]],
     max_tokens: int,
     model: Optional[str] = None
-) -> str:
+) -> ChatResult:
     """Groq chat with retry and circuit breaker."""
     breaker = _get_groq_circuit_breaker()
     return breaker.execute(_chat_with_groq, messages, max_tokens, model)
@@ -289,7 +401,7 @@ def _ollama_with_retry(
     messages: list[dict[str, Any]],
     max_tokens: int,
     model: Optional[str] = None
-) -> str:
+) -> ChatResult:
     """Ollama chat with retry and circuit breaker."""
     breaker = _get_ollama_circuit_breaker()
     return breaker.execute(_chat_with_ollama, messages, max_tokens, model)
@@ -300,36 +412,23 @@ def _hf_with_retry(
     messages: list[dict[str, Any]],
     max_tokens: int,
     model: Optional[str] = None
-) -> str:
+) -> ChatResult:
     """HuggingFace chat with retry and circuit breaker."""
     breaker = _get_hf_circuit_breaker()
     return breaker.execute(_chat_with_hf, messages, max_tokens, model)
 
 
-def chat(
+def _chat_internal(
     messages: list[dict[str, Any]],
     max_tokens: Optional[int] = None,
     model: Optional[str] = None,
     prefer_local: bool = False,
-) -> str:
+) -> ChatResult:
     """
-    Send messages to LLM with automatic fallback.
+    Internal: send messages to LLM with automatic fallback, returning full ChatResult.
 
     Default order: Groq GPT-OSS (fast cloud) -> Ollama (local) -> HuggingFace (backup).
     All backends have circuit breakers to prevent cascading failures.
-
-    Args:
-        messages: List of message dicts with 'role' and 'content'
-        max_tokens: Maximum tokens in response (default from config).
-                    For GPT-OSS models, reasoning overhead is added automatically.
-        model: Specific model to use (optional, will use fallback chain if not specified)
-        prefer_local: If True, try Ollama first (useful for offline mode)
-
-    Returns:
-        Assistant message content as string
-
-    Raises:
-        RuntimeError: If all backends fail
     """
     config = get_config()
     max_tokens = max_tokens or config.llm.max_tokens_default
@@ -361,6 +460,8 @@ def chat(
         result, backend, tier = degradation.execute()
         if tier > 0:
             logger.info("Used fallback backend: %s", backend)
+        # Accumulate cost for multi-call tracking (e.g. /research)
+        _accumulate_cost(result)
         return result
     except CircuitBreakerOpenError as e:
         logger.error("All circuit breakers open: %s", e)
@@ -374,6 +475,36 @@ def chat(
             "LLM request failed. "
             "Set GROQ_API_KEY for best speed, or check Ollama status (ollama list)."
         ) from e
+
+
+def chat(
+    messages: list[dict[str, Any]],
+    max_tokens: Optional[int] = None,
+    model: Optional[str] = None,
+    prefer_local: bool = False,
+) -> str:
+    """
+    Send messages to LLM with automatic fallback. Returns content string.
+
+    For cost tracking, use chat_with_usage() instead.
+    """
+    result = _chat_internal(messages, max_tokens, model, prefer_local)
+    return result.content
+
+
+def chat_with_usage(
+    messages: list[dict[str, Any]],
+    max_tokens: Optional[int] = None,
+    model: Optional[str] = None,
+    prefer_local: bool = False,
+) -> ChatResult:
+    """
+    Send messages to LLM with automatic fallback. Returns ChatResult with cost.
+
+    Same as chat() but returns the full ChatResult including:
+    - model used, token counts, cost_usd, backend
+    """
+    return _chat_internal(messages, max_tokens, model, prefer_local)
 
 
 def chat_with_json_output(

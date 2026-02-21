@@ -21,7 +21,15 @@ from slowapi.util import get_remote_address
 from src.agent.orchestrator import run as agent_run
 from src.config import get_config
 from src.crawl.fetcher import get_fetcher_status, fetch_and_extract
-from src.llm.client import health_check as llm_health_check, reset_circuit_breakers, chat
+from src.llm.client import (
+    health_check as llm_health_check,
+    reset_circuit_breakers,
+    chat,
+    chat_with_usage,
+    start_cost_tracking,
+    get_accumulated_cost,
+    ChatResult,
+)
 from src.email import (
     EmailVerifyRequest,
     EmailVerifyResponse,
@@ -156,6 +164,7 @@ class ResearchResponse(BaseModel):
         default=[],
         description="Verified claims from the response"
     )
+    cost_usd: float = Field(default=0.0, description="Total LLM inference cost in USD")
     error: Optional[str] = Field(
         default=None,
         description="Error message if something went wrong"
@@ -206,6 +215,7 @@ class AIQualifyResponse(BaseModel):
     qualified: bool = Field(description="True if score > 6")
     reasoning: str
     domain: str
+    cost_usd: float = Field(default=0.0, description="LLM inference cost in USD")
     error: Optional[str] = None
 
 
@@ -222,6 +232,7 @@ class AIProcessResponse(BaseModel):
     """General AI processing response."""
     output: str
     success: bool
+    cost_usd: float = Field(default=0.0, description="LLM inference cost in USD")
     error: Optional[str] = None
 
 
@@ -242,6 +253,7 @@ class QualifyResponse(BaseModel):
     qualified: bool = Field(description="True if score > 6")
     reasoning: str = Field(description="Brief reasoning")
     website: str
+    cost_usd: float = Field(default=0.0, description="LLM inference cost in USD")
     error: Optional[str] = None
 
 
@@ -266,6 +278,9 @@ async def research(request: Request, body: ResearchRequest):
     """
     opts = body.options or ResearchOptions()
 
+    # Start cost tracking for multi-call research pipeline
+    start_cost_tracking()
+
     try:
         result = agent_run(
             body.prompt,
@@ -280,6 +295,9 @@ async def research(request: Request, body: ResearchRequest):
             status_code=503,
             detail="Research failed. Please try again."
         ) from e
+
+    # Get accumulated cost from all LLM calls in the pipeline
+    cost_info = get_accumulated_cost()
 
     # Handle errors
     if result.get("error") and not result.get("content"):
@@ -329,6 +347,7 @@ async def research(request: Request, body: ResearchRequest):
         sources=sources,
         confidence=confidence,
         verified_claims=verified_claims,
+        cost_usd=cost_info["total_cost_usd"],
         error=result.get("error"),
     )
 
@@ -571,12 +590,13 @@ SCORE: [1-10]
 QUALIFIED: [YES/NO]
 REASONING: [One sentence]"""
 
-        response = chat(
+        result = chat_with_usage(
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200,
         )
 
         # Parse response
+        response = result.content
         score = 0
         qualified = False
         reasoning = response.strip()
@@ -600,6 +620,7 @@ REASONING: [One sentence]"""
             qualified=qualified,
             reasoning=reasoning,
             domain=domain,
+            cost_usd=round(result.cost_usd, 8),
         )
 
     except Exception as e:
@@ -632,14 +653,15 @@ async def ai_process(request: Request, body: AIProcessRequest):
         else:
             full_prompt = body.prompt
 
-        response = chat(
+        result = chat_with_usage(
             messages=[{"role": "user", "content": full_prompt}],
             max_tokens=body.max_tokens,
         )
 
         return AIProcessResponse(
-            output=response.strip(),
+            output=result.content.strip(),
             success=True,
+            cost_usd=round(result.cost_usd, 8),
         )
 
     except Exception as e:
@@ -653,7 +675,7 @@ async def ai_process(request: Request, body: AIProcessRequest):
 
 # ============== LEGACY ENDPOINTS ==============
 
-def _parse_qualify_response(response: str, url: str) -> QualifyResponse:
+def _parse_qualify_response(response: str, url: str, cost_usd: float = 0.0) -> QualifyResponse:
     """Parse LLM response into QualifyResponse."""
     import re
 
@@ -683,6 +705,7 @@ def _parse_qualify_response(response: str, url: str) -> QualifyResponse:
         qualified=qualified,
         reasoning=reasoning,
         website=url,
+        cost_usd=round(cost_usd, 8),
     )
 
 
@@ -713,12 +736,12 @@ SCORE: [1-10]
 QUALIFIED: [YES/NO]
 REASONING: [One sentence]"""
 
-        response = chat(
+        result = chat_with_usage(
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200,
         )
 
-        return _parse_qualify_response(response, body.url)
+        return _parse_qualify_response(result.content, body.url, cost_usd=result.cost_usd)
 
     except Exception as e:
         logger.exception("Qualification failed")
@@ -765,12 +788,12 @@ SCORE: [1-10]
 QUALIFIED: [YES/NO]
 REASONING: [One sentence]"""
 
-        response = chat(
+        result = chat_with_usage(
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200,
         )
 
-        return _parse_qualify_response(response, body.url)
+        return _parse_qualify_response(result.content, body.url, cost_usd=result.cost_usd)
 
     except Exception as e:
         logger.exception("Deep qualification failed")
@@ -1109,7 +1132,7 @@ h1{{font-size:28px;font-weight:700;color:#fff;margin-bottom:6px}}
   -H "Content-Type: application/json" \\
   -d '{{"prompt": "Summarize this company", "input_data": "Acme Corp builds cloud SaaS tools for enterprise", "max_tokens": 500}}'<button class="copy-btn" onclick="copyCmd(this)">Copy</button></div>
 <div class="section-title">Response</div>
-<div class="response-box">{{"output": "Acme Corp is a B2B SaaS company...", "success": true, "error": null}}</div>
+<div class="response-box">{{"output": "Acme Corp is a B2B SaaS company...", "success": true, "cost_usd": 0.00012345, "error": null}}</div>
 </div>
 </div>
 
@@ -1135,7 +1158,7 @@ h1{{font-size:28px;font-weight:700;color:#fff;margin-bottom:6px}}
   -H "Content-Type: application/json" \\
   -d '{{"content": "We build enterprise email automation tools for sales teams.", "domain": "acme.com", "criteria": "B2B SaaS that could integrate with email automation tools"}}'<button class="copy-btn" onclick="copyCmd(this)">Copy</button></div>
 <div class="section-title">Response</div>
-<div class="response-box">{{"score": 9, "qualified": true, "reasoning": "Enterprise email automation for sales teams is a strong B2B SaaS fit.", "domain": "acme.com", "error": null}}</div>
+<div class="response-box">{{"score": 9, "qualified": true, "reasoning": "Enterprise email automation for sales teams is a strong B2B SaaS fit.", "domain": "acme.com", "cost_usd": 0.00009876, "error": null}}</div>
 </div>
 </div>
 
@@ -1185,7 +1208,7 @@ h1{{font-size:28px;font-weight:700;color:#fff;margin-bottom:6px}}
   -H "Content-Type: application/json" \\
   -d '{{"url": "https://salesforce.com", "criteria": "B2B SaaS that could integrate with email automation tools"}}'<button class="copy-btn" onclick="copyCmd(this)">Copy</button></div>
 <div class="section-title">Response</div>
-<div class="response-box">{{"score": 9, "qualified": true, "reasoning": "Salesforce is a leading B2B SaaS CRM platform.", "website": "https://salesforce.com", "error": null}}</div>
+<div class="response-box">{{"score": 9, "qualified": true, "reasoning": "Salesforce is a leading B2B SaaS CRM platform.", "website": "https://salesforce.com", "cost_usd": 0.00008765, "error": null}}</div>
 </div>
 </div>
 
@@ -1210,7 +1233,7 @@ h1{{font-size:28px;font-weight:700;color:#fff;margin-bottom:6px}}
   -H "Content-Type: application/json" \\
   -d '{{"url": "https://stripe.com", "criteria": "B2B SaaS that could integrate with email automation tools"}}'<button class="copy-btn" onclick="copyCmd(this)">Copy</button></div>
 <div class="section-title">Response</div>
-<div class="response-box">{{"score": 8, "qualified": true, "reasoning": "Stripe is a B2B payments platform used by businesses.", "website": "https://stripe.com", "error": null}}</div>
+<div class="response-box">{{"score": 8, "qualified": true, "reasoning": "Stripe is a B2B payments platform used by businesses.", "website": "https://stripe.com", "cost_usd": 0.00011234, "error": null}}</div>
 </div>
 </div>
 
@@ -1235,7 +1258,7 @@ h1{{font-size:28px;font-weight:700;color:#fff;margin-bottom:6px}}
   -H "Content-Type: application/json" \\
   -d '{{"prompt": "What are the benefits of renewable energy?", "options": {{"format": "markdown", "max_sources": 5, "verify": true}}}}'<button class="copy-btn" onclick="copyCmd(this)">Copy</button></div>
 <div class="section-title">Response</div>
-<div class="response-box">{{"content": "## Benefits of Renewable Energy\\n...", "sources": [{{"url": "...", "title": "...", "snippet": "..."}}], "confidence": {{"overall": 0.85, "level": "high", ...}}, "verified_claims": [...], "error": null}}</div>
+<div class="response-box">{{"content": "## Benefits of Renewable Energy\\n...", "sources": [{{"url": "...", "title": "...", "snippet": "..."}}], "confidence": {{"overall": 0.85, "level": "high", ...}}, "verified_claims": [...], "cost_usd": 0.00045678, "error": null}}</div>
 </div>
 </div>
 
