@@ -13,13 +13,17 @@ from typing import Optional
 @dataclass
 class LLMConfig:
     """LLM backend configuration."""
-    # Groq settings (PRIMARY - fast cloud inference, FREE tier)
+    # Groq settings (PRIMARY - fast cloud inference)
     groq_base_url: str = "https://api.groq.com/openai/v1"
     groq_models: list[str] = field(default_factory=lambda: [
-        "llama-3.3-70b-versatile",  # Primary - best quality, 500 tok/s
-        "llama-3.1-8b-instant",      # Fallback - faster, lower latency
-        "mixtral-8x7b-32768",        # Fallback - good for long context
+        "openai/gpt-oss-20b",       # Primary - fastest, cheapest ($0.075/$0.30 per 1M tokens)
+        "openai/gpt-oss-120b",      # Fallback - higher quality reasoning ($0.15/$0.60 per 1M tokens)
+        "llama-3.1-8b-instant",     # Fallback - non-reasoning, fast
     ])
+
+    # GPT-OSS models use reasoning tokens that count toward max_tokens.
+    # We add this overhead to ensure enough room for both reasoning + output.
+    gpt_oss_reasoning_overhead: int = 1500
 
     # Ollama settings (LOCAL fallback)
     ollama_base_url: str = "http://localhost:11434/v1"

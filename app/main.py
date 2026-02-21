@@ -541,13 +541,14 @@ async def scrape_website(request: Request, body: ScrapeRequest):
 # ============== ENDPOINT 2: AI QUALIFICATION ==============
 
 @app.post("/ai/qualify", response_model=AIQualifyResponse)
-@limiter.limit("120/minute")
+@limiter.limit("300/minute")
 async def ai_qualify(request: Request, body: AIQualifyRequest):
     """
-    INSTANT AI qualification (~0.5 seconds).
+    AI qualification using GPT-OSS (~1-2 seconds).
 
     Analyzes pre-provided content - NO web scraping.
     Content should be provided by user (from /scrape or other source).
+    Uses GPT-OSS reasoning model for accurate qualification.
     """
     import re
 
@@ -570,7 +571,7 @@ REASONING: [One sentence]"""
 
         response = chat(
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=100,
+            max_tokens=200,
         )
 
         # Parse response
@@ -613,13 +614,14 @@ REASONING: [One sentence]"""
 # ============== ENDPOINT 3: AI PROCESSING ==============
 
 @app.post("/ai/process", response_model=AIProcessResponse)
-@limiter.limit("120/minute")
+@limiter.limit("300/minute")
 async def ai_process(request: Request, body: AIProcessRequest):
     """
-    INSTANT AI processing (~0.5-1 second).
+    AI processing using GPT-OSS (~1-2 seconds).
 
     General-purpose AI endpoint - NO web scraping.
     Send any prompt + input data, get AI response.
+    Uses GPT-OSS reasoning model for high-quality output.
     """
     try:
         # Build message
@@ -683,19 +685,17 @@ def _parse_qualify_response(response: str, url: str) -> QualifyResponse:
 
 
 @app.post("/qualify", response_model=QualifyResponse)
-@limiter.limit("60/minute")
+@limiter.limit("300/minute")
 async def qualify_website(request: Request, body: QualifyRequest):
     """
-    INSTANT website qualification (~1 second).
+    Website qualification using GPT-OSS (~1-2 seconds).
 
     Uses LLM's knowledge of the domain - NO website fetching.
-    This is 10x faster and won't timeout.
     """
     try:
         # Extract domain for cleaner prompt
         domain = body.url.replace("https://", "").replace("http://", "").replace("www.", "").split("/")[0]
 
-        # Super fast prompt - no fetching, just use LLM knowledge
         prompt = f"""You are an expert at identifying B2B SaaS companies.
 
 Analyze this company based on the domain name and your knowledge:
@@ -711,10 +711,9 @@ SCORE: [1-10]
 QUALIFIED: [YES/NO]
 REASONING: [One sentence]"""
 
-        # Use fastest model
         response = chat(
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=100,
+            max_tokens=200,
         )
 
         return _parse_qualify_response(response, body.url)
@@ -766,7 +765,7 @@ REASONING: [One sentence]"""
 
         response = chat(
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=100,
+            max_tokens=200,
         )
 
         return _parse_qualify_response(response, body.url)
@@ -950,30 +949,29 @@ async def reset_breakers():
 @app.get("/")
 async def root():
     """Root endpoint with API information."""
-    # Get Groq capacity info
-    num_keys = len(config.llm.groq_api_keys)
-    max_rpm = num_keys * 30
-    max_rps = round(num_keys * 0.5, 1)
+    primary_model = config.llm.groq_models[0] if config.llm.groq_models else "none"
 
     return {
         "name": "Open Source Web Scraper Agent",
-        "version": "2.0.0",
-        "description": "Research API with citation verification",
-        "groq_capacity": {
-            "num_keys": num_keys,
-            "max_requests_per_minute": max_rpm,
-            "max_requests_per_second": max_rps,
-            "clay_compatible": num_keys >= 2,  # Need 2+ keys for 1 req/sec
-            "estimated_timeout_rate": "0%" if num_keys >= 2 else f"~99%" if num_keys == 1 else "100%",
+        "version": "3.0.0",
+        "description": "Research & enrichment API powered by GPT-OSS on Groq",
+        "model": {
+            "primary": primary_model,
+            "fallback": config.llm.groq_models[1] if len(config.llm.groq_models) > 1 else None,
+            "type": "reasoning",
+            "pricing": {
+                "gpt-oss-20b": {"input": "$0.075/1M tokens", "output": "$0.30/1M tokens"},
+                "gpt-oss-120b": {"input": "$0.15/1M tokens", "output": "$0.60/1M tokens"},
+            },
         },
         "endpoints": {
             "POST /scrape": "Ultra-fast website scraper (2-5s)",
-            "POST /ai/qualify": "AI qualification (~0.5s)",
-            "POST /ai/process": "General AI processing (~0.5s)",
+            "POST /ai/qualify": "AI qualification via GPT-OSS (~1-2s, 300/min)",
+            "POST /ai/process": "General AI processing via GPT-OSS (~1-2s, 300/min)",
             "POST /research": "Full research with citations (10-30s)",
             "POST /email/verify": "Email verification via Reacher (5-30s)",
             "GET /health": "Check system health",
-            "GET /status": "Groq key status and capacity",
+            "GET /status": "Model and capacity status",
         },
         "docs": "/docs",
     }
@@ -982,47 +980,39 @@ async def root():
 @app.get("/status")
 async def status():
     """
-    Get detailed status of Groq API keys and throughput capacity.
+    Get detailed status of GPT-OSS models and throughput capacity.
 
     Shows:
-    - Number of Groq keys configured
-    - Max requests per minute/second
-    - Clay compatibility status
-    - Estimated timeout rate
+    - Model configuration (GPT-OSS 20B primary, 120B fallback)
+    - Rate limits and Clay compatibility
+    - Cost estimates per enrichment
     """
     num_keys = len(config.llm.groq_api_keys)
-    max_rpm = num_keys * 30
-    max_rps = round(num_keys * 0.5, 1)
-
-    # Calculate timeout estimates for different scenarios
-    timeout_info = {
-        "1_key": "99.4% timeout (only first 60 requests succeed)",
-        "2_keys": "~0% timeout (matches Clay's 1 req/sec)",
-        "3_keys": "0% timeout (faster than Clay)",
-        "4_keys": "0% timeout (2x Clay's speed)",
-    }
+    primary_model = config.llm.groq_models[0] if config.llm.groq_models else "none"
 
     return {
-        "groq": {
+        "model": {
+            "primary": primary_model,
+            "fallback": config.llm.groq_models[1] if len(config.llm.groq_models) > 1 else None,
+            "type": "reasoning (GPT-OSS uses internal chain-of-thought)",
             "num_keys": num_keys,
-            "max_requests_per_minute": max_rpm,
-            "max_requests_per_second": max_rps,
-            "can_handle_clay_rate": num_keys >= 2,
+        },
+        "rate_limits": {
+            "ai_qualify": "300/minute (5 req/sec)",
+            "ai_process": "300/minute (5 req/sec)",
+            "scrape": "200/minute",
+            "research": "10/second",
+            "note": "Groq Developer tier provides ~300 RPM per key (5 req/sec)",
         },
         "clay_compatibility": {
-            "clay_sends": "1 request/second (60/min)",
-            "your_capacity": f"{max_rps} requests/second ({max_rpm}/min)",
-            "status": "OK" if num_keys >= 2 else "WILL TIMEOUT",
-            "recommendation": (
-                "Add more Groq API keys (GROQ_API_KEYS=key1,key2,...)"
-                if num_keys < 2
-                else f"Good! {num_keys} keys = {max_rpm} req/min capacity"
-            ),
+            "clay_minimum": "5 requests/second (300/min)",
+            "status": "OK - use Groq Developer tier for 300+ RPM per key",
+            "recommendation": "Upgrade to Groq Developer tier at console.groq.com for 5 req/sec with a single key",
         },
-        "timeout_estimates": timeout_info,
-        "10k_row_estimate": {
-            "time_to_complete": f"{round(10000 / max(max_rps, 0.1) / 60, 1)} minutes" if num_keys > 0 else "N/A",
-            "timeouts": "0%" if num_keys >= 2 else "99.4%",
+        "cost_per_enrichment": {
+            "gpt_oss_20b": "~$0.000275 per record (~$275 per 1M records)",
+            "gpt_oss_120b": "~$0.000582 per record (~$582 per 1M records)",
+            "vs_gpt4o_mini": "5.3x cheaper (GPT-OSS 20B) / 2.5x cheaper (GPT-OSS 120B)",
         },
     }
 

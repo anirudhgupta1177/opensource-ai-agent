@@ -1,10 +1,12 @@
 """
 LLM client with multi-model support, circuit breaker, and graceful degradation.
-Uses GPT-OSS alternatives (Qwen, Mistral, DeepSeek) via Ollama, with HuggingFace fallback.
-All models are free and open-source.
+Uses GPT-OSS on Groq (primary), with Ollama and HuggingFace fallbacks.
+
+GPT-OSS models are reasoning models — they produce internal reasoning tokens
+before the final output. The client automatically adds token overhead for these.
 
 Supports multiple Groq API keys for higher throughput (round-robin rotation).
-Set GROQ_API_KEYS=key1,key2,key3 for 3x throughput.
+With Groq Developer tier, a single key provides ~300 RPM (5 req/sec).
 """
 from __future__ import annotations
 
@@ -34,6 +36,11 @@ _hf_circuit_breaker: Optional[CircuitBreaker] = None
 # Groq key rotation state (thread-safe)
 _groq_key_index: int = 0
 _groq_key_lock = threading.Lock()
+
+
+def _is_reasoning_model(model_name: str) -> bool:
+    """Check if a model is a reasoning model (GPT-OSS) that uses reasoning tokens."""
+    return "gpt-oss" in model_name.lower() and "safeguard" not in model_name.lower()
 
 
 def _get_groq_circuit_breaker() -> CircuitBreaker:
@@ -102,10 +109,9 @@ def _make_groq_client() -> Optional[OpenAI]:
     """
     Create Groq OpenAI-compatible client with round-robin key rotation.
 
-    Each call uses the next API key in the rotation, allowing:
-    - 2 keys = 60 req/min (1 req/sec) - matches Clay's rate
-    - 3 keys = 90 req/min (1.5 req/sec) - faster than Clay
-    - 4 keys = 120 req/min (2 req/sec) - comfortable headroom
+    With Groq Developer tier (paid), a single key provides:
+    - ~300 RPM (5 req/sec) — matches Clay's minimum rate
+    - Multiple keys provide redundancy and higher throughput
     """
     api_key = _get_next_groq_key()
     if not api_key:
@@ -149,7 +155,8 @@ def _chat_with_groq(
 ) -> str:
     """
     Chat using Groq with automatic model fallback.
-    Groq provides ~500 tokens/sec with 70B models - extremely fast!
+    Handles GPT-OSS reasoning models by adding token overhead
+    and extracting content from reasoning responses.
     """
     config = get_config()
     client = _make_groq_client()
@@ -163,10 +170,17 @@ def _chat_with_groq(
     for model_name in models:
         try:
             logger.debug("Trying Groq model: %s", model_name)
+
+            # GPT-OSS reasoning models use reasoning tokens that count toward max_tokens.
+            # Add overhead so there's room for both reasoning + output.
+            effective_max_tokens = max_tokens
+            if _is_reasoning_model(model_name):
+                effective_max_tokens = max_tokens + config.llm.gpt_oss_reasoning_overhead
+
             resp = client.chat.completions.create(
                 model=model_name,
                 messages=messages,
-                max_tokens=max_tokens,
+                max_tokens=effective_max_tokens,
             )
             if resp.choices and resp.choices[0].message:
                 content = resp.choices[0].message.content
@@ -301,12 +315,13 @@ def chat(
     """
     Send messages to LLM with automatic fallback.
 
-    Default order: Groq (fast cloud) → Ollama (local) → HuggingFace (backup cloud).
+    Default order: Groq GPT-OSS (fast cloud) -> Ollama (local) -> HuggingFace (backup).
     All backends have circuit breakers to prevent cascading failures.
 
     Args:
         messages: List of message dicts with 'role' and 'content'
-        max_tokens: Maximum tokens in response (default from config)
+        max_tokens: Maximum tokens in response (default from config).
+                    For GPT-OSS models, reasoning overhead is added automatically.
         model: Specific model to use (optional, will use fallback chain if not specified)
         prefer_local: If True, try Ollama first (useful for offline mode)
 
@@ -319,7 +334,7 @@ def chat(
     config = get_config()
     max_tokens = max_tokens or config.llm.max_tokens_default
 
-    # Build fallback chain: Groq (fastest) → Ollama (local) → HuggingFace (backup)
+    # Build fallback chain: Groq (fastest) -> Ollama (local) -> HuggingFace (backup)
     if prefer_local:
         handlers = [
             (lambda m=messages, t=max_tokens, mod=model: _ollama_with_retry(m, t, mod), "Ollama"),
@@ -400,7 +415,7 @@ def health_check() -> dict[str, Any]:
 
     Returns dict with status of each backend:
     {
-        "groq": {"available": bool, "configured": bool, "num_keys": int, "max_rpm": int, "models": list, "error": str or None},
+        "groq": {"available": bool, "configured": bool, "num_keys": int, "models": list, "error": str or None},
         "ollama": {"available": bool, "models": list, "error": str or None},
         "huggingface": {"available": bool, "configured": bool, "error": str or None}
     }
@@ -412,8 +427,7 @@ def health_check() -> dict[str, Any]:
             "available": False,
             "configured": num_groq_keys > 0,
             "num_keys": num_groq_keys,
-            "max_rpm": num_groq_keys * 30,  # 30 requests/min per key
-            "max_rps": round(num_groq_keys * 0.5, 1),  # 0.5 requests/sec per key
+            "primary_model": config.llm.groq_models[0] if config.llm.groq_models else None,
             "models": [],
             "error": None
         },
@@ -426,9 +440,9 @@ def health_check() -> dict[str, Any]:
         try:
             client = _make_groq_client()
             if client:
-                # Try a simple completion to verify
+                # Try a simple completion to verify (use non-reasoning model for health check)
                 resp = client.chat.completions.create(
-                    model=config.llm.groq_models[0],
+                    model="llama-3.1-8b-instant",
                     messages=[{"role": "user", "content": "Hi"}],
                     max_tokens=5,
                 )
@@ -441,7 +455,6 @@ def health_check() -> dict[str, Any]:
     # Check Ollama
     try:
         client = _make_ollama_client()
-        # Try a simple completion to verify
         resp = client.chat.completions.create(
             model=config.llm.ollama_models[0],
             messages=[{"role": "user", "content": "Hi"}],
@@ -459,7 +472,6 @@ def health_check() -> dict[str, Any]:
         try:
             client = _make_hf_client()
             if client:
-                # Just check if we can create the client
                 status["huggingface"]["available"] = True
         except Exception as e:
             status["huggingface"]["error"] = str(e)[:200]
