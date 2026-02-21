@@ -1,0 +1,39 @@
+# Open Source Web Scraper Agent - Dependencies
+# All packages are free and open-source
+
+# Web Framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+
+# LLM Integration (OpenAI-compatible client for Ollama/HuggingFace)
+openai>=1.55.0
+
+# HTTP Client
+requests>=2.32.0
+httpx[http2]>=0.27.0
+
+# Web Content Extraction
+trafilatura>=2.0.0
+lxml_html_clean>=0.3.0
+
+# Crawl4AI for JavaScript rendering (optional, needs playwright)
+# Install locally: pip install crawl4ai
+# Not included by default - app works without it
+
+# Web Search (free, no API key required)
+duckduckgo-search>=6.0.0
+
+# Rate Limiting
+slowapi>=0.1.9
+
+# Environment Management
+python-dotenv>=1.0.0
+
+# Token Counting (for accurate context management)
+tiktoken>=0.7.0
+
+# Relevance Scoring (TF-IDF for source prioritization)
+scikit-learn>=1.5.0
+
+# Optional: For numpy compatibility with scikit-learn
+numpy>=1.26.0
