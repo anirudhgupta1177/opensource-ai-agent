@@ -32,8 +32,5 @@ python-dotenv>=1.0.0
 # Token Counting (for accurate context management)
 tiktoken>=0.7.0
 
-# Relevance Scoring (TF-IDF for source prioritization)
-scikit-learn>=1.5.0
-
-# Optional: For numpy compatibility with scikit-learn
-numpy>=1.26.0
+# Relevance Scoring - optional, install locally for better quality
+# pip install scikit-learn numpy
