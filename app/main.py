@@ -12,6 +12,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -54,14 +55,15 @@ limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(
     title="Open Source Web Scraper Agent",
     description=(
-        "Research API: send a prompt, get cited answers from web search + GPT-OSS.\n\n"
+        "Research & enrichment API powered by GPT-OSS on Groq.\n\n"
         "Features:\n"
+        "- GPT-OSS reasoning models (20B primary, 120B fallback)\n"
         "- Multi-step reasoning with ReAct agent\n"
         "- Query decomposition for complex questions\n"
         "- Citation verification and confidence scoring\n"
-        "- 100% free, open-source models (Ollama + HuggingFace)"
+        "- 10 req/sec throughput for Clay integration"
     ),
-    version="2.0.0",
+    version="3.0.0",
 )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -1014,6 +1016,307 @@ async def status():
             "vs_gpt4o_mini": "5.3x cheaper (GPT-OSS 20B) / 2.5x cheaper (GPT-OSS 120B)",
         },
     }
+
+
+@app.get("/api-docs", response_class=HTMLResponse)
+async def api_docs(request: Request):
+    """Interactive API docs with copyable curl commands."""
+    base = str(request.base_url).rstrip("/")
+    primary_model = config.llm.groq_models[0] if config.llm.groq_models else "openai/gpt-oss-20b"
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>API Docs — Open Source AI Agent</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a0a;color:#e0e0e0;line-height:1.6}}
+.container{{max-width:900px;margin:0 auto;padding:24px 20px}}
+h1{{font-size:28px;font-weight:700;color:#fff;margin-bottom:6px}}
+.subtitle{{color:#888;font-size:14px;margin-bottom:32px}}
+.badge{{display:inline-block;background:#1a3a1a;color:#4ade80;font-size:11px;font-weight:600;padding:2px 8px;border-radius:4px;margin-left:8px}}
+.endpoint{{background:#141414;border:1px solid #2a2a2a;border-radius:12px;margin-bottom:20px;overflow:hidden}}
+.endpoint-header{{display:flex;align-items:center;gap:10px;padding:16px 20px;cursor:pointer;user-select:none}}
+.endpoint-header:hover{{background:#1a1a1a}}
+.method{{font-size:12px;font-weight:700;padding:4px 10px;border-radius:6px;font-family:monospace}}
+.method-post{{background:#1a2a4a;color:#60a5fa}}
+.method-get{{background:#1a3a1a;color:#4ade80}}
+.path{{font-family:monospace;font-size:15px;font-weight:600;color:#fff}}
+.desc{{color:#888;font-size:13px;margin-left:auto;white-space:nowrap}}
+.rate{{font-size:11px;color:#666;font-family:monospace}}
+.endpoint-body{{display:none;padding:0 20px 20px;border-top:1px solid #2a2a2a}}
+.endpoint.open .endpoint-body{{display:block}}
+.endpoint.open .endpoint-header{{border-bottom:none}}
+.section-title{{font-size:12px;font-weight:600;color:#888;text-transform:uppercase;letter-spacing:1px;margin:16px 0 8px}}
+.curl-box{{position:relative;background:#0d0d0d;border:1px solid #2a2a2a;border-radius:8px;padding:14px 16px;padding-right:80px;font-family:'SF Mono',Monaco,'Cascadia Code',monospace;font-size:13px;color:#c9d1d9;overflow-x:auto;white-space:pre-wrap;word-break:break-all;line-height:1.5}}
+.copy-btn{{position:absolute;top:10px;right:10px;background:#2a2a2a;color:#ccc;border:none;padding:6px 14px;border-radius:6px;font-size:12px;cursor:pointer;font-family:inherit;transition:all 0.15s}}
+.copy-btn:hover{{background:#3a3a3a;color:#fff}}
+.copy-btn.copied{{background:#1a3a1a;color:#4ade80}}
+.response-box{{background:#0d0d0d;border:1px solid #2a2a2a;border-radius:8px;padding:14px 16px;font-family:monospace;font-size:12px;color:#7c8a99;overflow-x:auto;white-space:pre;line-height:1.5}}
+.params{{width:100%;border-collapse:collapse;font-size:13px;margin-top:4px}}
+.params td{{padding:6px 0;vertical-align:top}}
+.params td:first-child{{font-family:monospace;color:#60a5fa;font-weight:600;width:120px}}
+.params td:nth-child(2){{color:#888;font-style:italic;width:70px}}
+.params td:last-child{{color:#aaa}}
+.params tr{{border-bottom:1px solid #1a1a1a}}
+.footer{{text-align:center;color:#444;font-size:12px;margin-top:40px;padding:20px}}
+.footer a{{color:#60a5fa;text-decoration:none}}
+.chevron{{color:#555;margin-left:auto;transition:transform 0.2s;font-size:18px}}
+.endpoint.open .chevron{{transform:rotate(90deg)}}
+.nav{{display:flex;gap:8px;margin-bottom:24px;flex-wrap:wrap}}
+.nav a{{color:#888;font-size:12px;text-decoration:none;padding:4px 12px;border:1px solid #2a2a2a;border-radius:6px;transition:all 0.15s}}
+.nav a:hover{{color:#fff;border-color:#444}}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>Open Source AI Agent API <span class="badge">v3.0.0</span></h1>
+<p class="subtitle">Powered by GPT-OSS on Groq &mdash; {primary_model} &mdash; 10 req/sec</p>
+
+<div class="nav">
+<a href="#ai-process">AI Process</a>
+<a href="#ai-qualify">AI Qualify</a>
+<a href="#scrape">Scrape</a>
+<a href="#qualify">Qualify</a>
+<a href="#qualify-deep">Qualify Deep</a>
+<a href="#research">Research</a>
+<a href="#email-verify">Email Verify</a>
+<a href="#health">Health</a>
+<a href="#status">Status</a>
+</div>
+
+<!-- AI Process -->
+<div class="endpoint open" id="ai-process">
+<div class="endpoint-header" onclick="toggle(this)">
+<span class="method method-post">POST</span>
+<span class="path">/ai/process</span>
+<span class="desc">General AI processing</span>
+<span class="rate">600/min</span>
+<span class="chevron">&#9656;</span>
+</div>
+<div class="endpoint-body">
+<p style="color:#aaa;font-size:13px;margin-bottom:12px">Send any prompt + input data, get AI response via GPT-OSS. No web scraping.</p>
+<div class="section-title">Parameters</div>
+<table class="params">
+<tr><td>prompt</td><td>string</td><td>The prompt/instruction (required)</td></tr>
+<tr><td>input_data</td><td>string</td><td>Input data to process (optional)</td></tr>
+<tr><td>max_tokens</td><td>int</td><td>Max response tokens, default 500 (50-4000)</td></tr>
+</table>
+<div class="section-title">Curl</div>
+<div class="curl-box">curl -X POST {base}/ai/process \\
+  -H "Content-Type: application/json" \\
+  -d '{{"prompt": "Summarize this company", "input_data": "Acme Corp builds cloud SaaS tools for enterprise", "max_tokens": 500}}'<button class="copy-btn" onclick="copyCmd(this)">Copy</button></div>
+<div class="section-title">Response</div>
+<div class="response-box">{{"output": "Acme Corp is a B2B SaaS company...", "success": true, "error": null}}</div>
+</div>
+</div>
+
+<!-- AI Qualify -->
+<div class="endpoint" id="ai-qualify">
+<div class="endpoint-header" onclick="toggle(this)">
+<span class="method method-post">POST</span>
+<span class="path">/ai/qualify</span>
+<span class="desc">AI lead qualification</span>
+<span class="rate">600/min</span>
+<span class="chevron">&#9656;</span>
+</div>
+<div class="endpoint-body">
+<p style="color:#aaa;font-size:13px;margin-bottom:12px">Analyze pre-provided content and score against criteria. No web scraping.</p>
+<div class="section-title">Parameters</div>
+<table class="params">
+<tr><td>content</td><td>string</td><td>Website content to analyze (required, max 50k chars)</td></tr>
+<tr><td>domain</td><td>string</td><td>Domain name for context (optional)</td></tr>
+<tr><td>criteria</td><td>string</td><td>Qualification criteria (default: B2B SaaS)</td></tr>
+</table>
+<div class="section-title">Curl</div>
+<div class="curl-box">curl -X POST {base}/ai/qualify \\
+  -H "Content-Type: application/json" \\
+  -d '{{"content": "We build enterprise email automation tools for sales teams.", "domain": "acme.com", "criteria": "B2B SaaS that could integrate with email automation tools"}}'<button class="copy-btn" onclick="copyCmd(this)">Copy</button></div>
+<div class="section-title">Response</div>
+<div class="response-box">{{"score": 9, "qualified": true, "reasoning": "Enterprise email automation for sales teams is a strong B2B SaaS fit.", "domain": "acme.com", "error": null}}</div>
+</div>
+</div>
+
+<!-- Scrape -->
+<div class="endpoint" id="scrape">
+<div class="endpoint-header" onclick="toggle(this)">
+<span class="method method-post">POST</span>
+<span class="path">/scrape</span>
+<span class="desc">Website scraper</span>
+<span class="rate">200/min</span>
+<span class="chevron">&#9656;</span>
+</div>
+<div class="endpoint-body">
+<p style="color:#aaa;font-size:13px;margin-bottom:12px">Ultra-fast website scraper with rotating User-Agents, retry logic, and bot detection.</p>
+<div class="section-title">Parameters</div>
+<table class="params">
+<tr><td>url</td><td>string</td><td>Website URL to scrape (required)</td></tr>
+<tr><td>timeout</td><td>int</td><td>Timeout in seconds, default 8 (1-30)</td></tr>
+</table>
+<div class="section-title">Curl</div>
+<div class="curl-box">curl -X POST {base}/scrape \\
+  -H "Content-Type: application/json" \\
+  -d '{{"url": "https://example.com", "timeout": 8}}'<button class="copy-btn" onclick="copyCmd(this)">Copy</button></div>
+<div class="section-title">Response</div>
+<div class="response-box">{{"url": "https://example.com", "domain": "example.com", "content": "Example Domain. This domain is for use in illustrative examples...", "content_length": 1256, "success": true, "bot_protected": false, "error": null}}</div>
+</div>
+</div>
+
+<!-- Qualify -->
+<div class="endpoint" id="qualify">
+<div class="endpoint-header" onclick="toggle(this)">
+<span class="method method-post">POST</span>
+<span class="path">/qualify</span>
+<span class="desc">Qualify by domain (no fetch)</span>
+<span class="rate">600/min</span>
+<span class="chevron">&#9656;</span>
+</div>
+<div class="endpoint-body">
+<p style="color:#aaa;font-size:13px;margin-bottom:12px">Qualify a website using LLM knowledge only. No fetching, instant response.</p>
+<div class="section-title">Parameters</div>
+<table class="params">
+<tr><td>url</td><td>string</td><td>Website URL to analyze (required)</td></tr>
+<tr><td>criteria</td><td>string</td><td>Qualification criteria (default: B2B SaaS)</td></tr>
+</table>
+<div class="section-title">Curl</div>
+<div class="curl-box">curl -X POST {base}/qualify \\
+  -H "Content-Type: application/json" \\
+  -d '{{"url": "https://salesforce.com", "criteria": "B2B SaaS that could integrate with email automation tools"}}'<button class="copy-btn" onclick="copyCmd(this)">Copy</button></div>
+<div class="section-title">Response</div>
+<div class="response-box">{{"score": 9, "qualified": true, "reasoning": "Salesforce is a leading B2B SaaS CRM platform.", "website": "https://salesforce.com", "error": null}}</div>
+</div>
+</div>
+
+<!-- Qualify Deep -->
+<div class="endpoint" id="qualify-deep">
+<div class="endpoint-header" onclick="toggle(this)">
+<span class="method method-post">POST</span>
+<span class="path">/qualify-deep</span>
+<span class="desc">Qualify with content fetch</span>
+<span class="rate">30/min</span>
+<span class="chevron">&#9656;</span>
+</div>
+<div class="endpoint-body">
+<p style="color:#aaa;font-size:13px;margin-bottom:12px">Fetches website content then qualifies. Slower but more accurate.</p>
+<div class="section-title">Parameters</div>
+<table class="params">
+<tr><td>url</td><td>string</td><td>Website URL to fetch and analyze (required)</td></tr>
+<tr><td>criteria</td><td>string</td><td>Qualification criteria (default: B2B SaaS)</td></tr>
+</table>
+<div class="section-title">Curl</div>
+<div class="curl-box">curl -X POST {base}/qualify-deep \\
+  -H "Content-Type: application/json" \\
+  -d '{{"url": "https://stripe.com", "criteria": "B2B SaaS that could integrate with email automation tools"}}'<button class="copy-btn" onclick="copyCmd(this)">Copy</button></div>
+<div class="section-title">Response</div>
+<div class="response-box">{{"score": 8, "qualified": true, "reasoning": "Stripe is a B2B payments platform used by businesses.", "website": "https://stripe.com", "error": null}}</div>
+</div>
+</div>
+
+<!-- Research -->
+<div class="endpoint" id="research">
+<div class="endpoint-header" onclick="toggle(this)">
+<span class="method method-post">POST</span>
+<span class="path">/research</span>
+<span class="desc">Full research with citations</span>
+<span class="rate">10/sec</span>
+<span class="chevron">&#9656;</span>
+</div>
+<div class="endpoint-body">
+<p style="color:#aaa;font-size:13px;margin-bottom:12px">Searches the web, fetches content, synthesizes an answer with citations and confidence scoring.</p>
+<div class="section-title">Parameters</div>
+<table class="params">
+<tr><td>prompt</td><td>string</td><td>Research query (required, 3-2000 chars)</td></tr>
+<tr><td>options</td><td>object</td><td>Optional: format, max_sources, use_react, verify</td></tr>
+</table>
+<div class="section-title">Curl</div>
+<div class="curl-box">curl -X POST {base}/research \\
+  -H "Content-Type: application/json" \\
+  -d '{{"prompt": "What are the benefits of renewable energy?", "options": {{"format": "markdown", "max_sources": 5, "verify": true}}}}'<button class="copy-btn" onclick="copyCmd(this)">Copy</button></div>
+<div class="section-title">Response</div>
+<div class="response-box">{{"content": "## Benefits of Renewable Energy\\n...", "sources": [{{"url": "...", "title": "...", "snippet": "..."}}], "confidence": {{"overall": 0.85, "level": "high", ...}}, "verified_claims": [...], "error": null}}</div>
+</div>
+</div>
+
+<!-- Email Verify -->
+<div class="endpoint" id="email-verify">
+<div class="endpoint-header" onclick="toggle(this)">
+<span class="method method-post">POST</span>
+<span class="path">/email/verify</span>
+<span class="desc">Email verification</span>
+<span class="rate">30/min</span>
+<span class="chevron">&#9656;</span>
+</div>
+<div class="endpoint-body">
+<p style="color:#aaa;font-size:13px;margin-bottom:12px">Verify email via Reacher: syntax, MX, SMTP, disposable detection. Requires REACHER_API_SECRET.</p>
+<div class="section-title">Parameters</div>
+<table class="params">
+<tr><td>email</td><td>string</td><td>Email address to verify (required)</td></tr>
+<tr><td>check_smtp</td><td>bool</td><td>Enable SMTP verification (optional)</td></tr>
+<tr><td>check_gravatar</td><td>bool</td><td>Check for Gravatar (optional)</td></tr>
+</table>
+<div class="section-title">Curl</div>
+<div class="curl-box">curl -X POST {base}/email/verify \\
+  -H "Content-Type: application/json" \\
+  -d '{{"email": "test@example.com"}}'<button class="copy-btn" onclick="copyCmd(this)">Copy</button></div>
+<div class="section-title">Response</div>
+<div class="response-box">{{"email": "test@example.com", "reachable": "safe", "is_valid_syntax": true, "domain": "example.com", "has_mx_records": true, ...}}</div>
+</div>
+</div>
+
+<!-- Health -->
+<div class="endpoint" id="health">
+<div class="endpoint-header" onclick="toggle(this)">
+<span class="method method-get">GET</span>
+<span class="path">/health</span>
+<span class="desc">System health check</span>
+<span class="rate">&mdash;</span>
+<span class="chevron">&#9656;</span>
+</div>
+<div class="endpoint-body">
+<div class="section-title">Curl</div>
+<div class="curl-box">curl {base}/health<button class="copy-btn" onclick="copyCmd(this)">Copy</button></div>
+<div class="section-title">Response</div>
+<div class="response-box">{{"status": "ok", "llm": {{"groq": {{"available": true, "primary_model": "openai/gpt-oss-20b", ...}}}}, "crawl": {{...}}}}</div>
+</div>
+</div>
+
+<!-- Status -->
+<div class="endpoint" id="status">
+<div class="endpoint-header" onclick="toggle(this)">
+<span class="method method-get">GET</span>
+<span class="path">/status</span>
+<span class="desc">Model &amp; capacity status</span>
+<span class="rate">&mdash;</span>
+<span class="chevron">&#9656;</span>
+</div>
+<div class="endpoint-body">
+<div class="section-title">Curl</div>
+<div class="curl-box">curl {base}/status<button class="copy-btn" onclick="copyCmd(this)">Copy</button></div>
+<div class="section-title">Response</div>
+<div class="response-box">{{"model": {{"primary": "openai/gpt-oss-20b", "fallback": "openai/gpt-oss-120b", ...}}, "rate_limits": {{...}}, "cost_per_enrichment": {{...}}}}</div>
+</div>
+</div>
+
+<div class="footer">
+<p>Built with FastAPI + GPT-OSS on Groq &mdash; <a href="/docs">Swagger UI</a> &mdash; <a href="/redoc">ReDoc</a></p>
+</div>
+</div>
+<script>
+function toggle(el){{el.parentElement.classList.toggle('open')}}
+function copyCmd(btn){{
+  const box=btn.parentElement;
+  const text=box.innerText.replace('Copy','').replace('Copied!','').trim();
+  navigator.clipboard.writeText(text).then(()=>{{
+    btn.textContent='Copied!';btn.classList.add('copied');
+    setTimeout(()=>{{btn.textContent='Copy';btn.classList.remove('copied')}},2000);
+  }});
+}}
+</script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
 
 
 if __name__ == "__main__":
