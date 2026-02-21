@@ -13,11 +13,16 @@ from typing import Optional
 @dataclass
 class LLMConfig:
     """LLM backend configuration."""
-    # Groq settings (PRIMARY - fast cloud inference)
+    # DeepInfra settings (PRIMARY - cheapest cloud inference, 200 concurrent requests)
+    deepinfra_base_url: str = "https://api.deepinfra.com/v1/openai"
+    deepinfra_models: list[str] = field(default_factory=lambda: [
+        "openai/gpt-oss-20b",       # Primary - same model, 54% cheaper ($0.03/$0.14 per 1M tokens)
+    ])
+
+    # Groq settings (FALLBACK - fast cloud inference)
     groq_base_url: str = "https://api.groq.com/openai/v1"
     groq_models: list[str] = field(default_factory=lambda: [
-        "openai/gpt-oss-20b",       # Primary - fastest, cheapest ($0.075/$0.30 per 1M tokens)
-        "openai/gpt-oss-120b",      # Fallback - higher quality reasoning ($0.15/$0.60 per 1M tokens)
+        "openai/gpt-oss-20b",       # Primary - fast ($0.075/$0.30 per 1M tokens)
         "llama-3.1-8b-instant",     # Fallback - non-reasoning, fast
     ])
 
@@ -44,6 +49,12 @@ class LLMConfig:
     timeout: float = 60.0
     max_retries: int = 3
     max_tokens_default: int = 4096
+
+    @property
+    def deepinfra_api_key(self) -> Optional[str]:
+        """Get DeepInfra API key from environment."""
+        key = os.getenv("DEEPINFRA_API_KEY", "").strip()
+        return key if key else None
 
     @property
     def groq_api_key(self) -> Optional[str]:

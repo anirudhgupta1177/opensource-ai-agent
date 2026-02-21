@@ -1,12 +1,13 @@
 """
 LLM client with multi-model support, circuit breaker, and graceful degradation.
-Uses GPT-OSS on Groq (primary), with Ollama and HuggingFace fallbacks.
+Uses GPT-OSS on DeepInfra (primary, cheapest), with Groq fallback, plus Ollama
+and HuggingFace as local/free fallbacks.
 
 GPT-OSS models are reasoning models — they produce internal reasoning tokens
 before the final output. The client automatically adds token overhead for these.
 
-Supports multiple Groq API keys for higher throughput (round-robin rotation).
-With Groq Developer tier, a single key provides ~300 RPM (5 req/sec).
+DeepInfra: 200 concurrent requests, no daily cap, $0.03/$0.14 per 1M tokens.
+Groq (fallback): ~300 RPM, $0.075/$0.30 per 1M tokens.
 """
 from __future__ import annotations
 
@@ -46,8 +47,13 @@ class ChatResult:
     backend: str  # "groq", "ollama", "huggingface"
 
 
-# Groq pricing per 1M tokens: (input_price, output_price)
-MODEL_PRICING: dict[str, tuple[float, float]] = {
+# Pricing per 1M tokens: (input_price, output_price)
+# Backend-specific pricing is resolved via _calculate_cost(model, backend, ...)
+DEEPINFRA_PRICING: dict[str, tuple[float, float]] = {
+    "openai/gpt-oss-20b": (0.03, 0.14),
+}
+
+GROQ_PRICING: dict[str, tuple[float, float]] = {
     "openai/gpt-oss-20b": (0.075, 0.30),
     "openai/gpt-oss-120b": (0.15, 0.60),
     "llama-3.1-8b-instant": (0.05, 0.08),
@@ -58,12 +64,13 @@ MODEL_PRICING: dict[str, tuple[float, float]] = {
 }
 
 
-def _calculate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
-    """Calculate cost in USD based on model pricing and token counts."""
-    pricing = MODEL_PRICING.get(model)
+def _calculate_cost(model: str, prompt_tokens: int, completion_tokens: int, backend: str = "groq") -> float:
+    """Calculate cost in USD based on backend, model pricing and token counts."""
+    pricing_table = DEEPINFRA_PRICING if backend == "deepinfra" else GROQ_PRICING
+    pricing = pricing_table.get(model)
     if not pricing:
         # Partial match fallback
-        for key, prices in MODEL_PRICING.items():
+        for key, prices in pricing_table.items():
             if key in model or model in key:
                 pricing = prices
                 break
@@ -104,6 +111,7 @@ def _accumulate_cost(result: ChatResult) -> None:
         _cost_tracker.total_completion_tokens += result.completion_tokens
 
 # Circuit breakers for each backend
+_deepinfra_circuit_breaker: Optional[CircuitBreaker] = None
 _groq_circuit_breaker: Optional[CircuitBreaker] = None
 _ollama_circuit_breaker: Optional[CircuitBreaker] = None
 _hf_circuit_breaker: Optional[CircuitBreaker] = None
@@ -116,6 +124,20 @@ _groq_key_lock = threading.Lock()
 def _is_reasoning_model(model_name: str) -> bool:
     """Check if a model is a reasoning model (GPT-OSS) that uses reasoning tokens."""
     return "gpt-oss" in model_name.lower() and "safeguard" not in model_name.lower()
+
+
+def _get_deepinfra_circuit_breaker() -> CircuitBreaker:
+    """Get or create DeepInfra circuit breaker."""
+    global _deepinfra_circuit_breaker
+    if _deepinfra_circuit_breaker is None:
+        config = get_config()
+        _deepinfra_circuit_breaker = CircuitBreaker(
+            failure_threshold=config.resilience.circuit_breaker_threshold,
+            recovery_timeout=config.resilience.circuit_breaker_timeout,
+            half_open_max_calls=config.resilience.circuit_breaker_half_open_calls,
+            name="deepinfra"
+        )
+    return _deepinfra_circuit_breaker
 
 
 def _get_groq_circuit_breaker() -> CircuitBreaker:
@@ -180,6 +202,25 @@ def _get_next_groq_key() -> Optional[str]:
         return key
 
 
+def _make_deepinfra_client() -> Optional[OpenAI]:
+    """
+    Create DeepInfra OpenAI-compatible client.
+
+    DeepInfra provides 200 concurrent requests (no daily cap).
+    54% cheaper than Groq for GPT-OSS 20B.
+    """
+    config = get_config()
+    api_key = config.llm.deepinfra_api_key
+    if not api_key:
+        return None
+
+    return OpenAI(
+        base_url=config.llm.deepinfra_base_url,
+        api_key=api_key,
+        timeout=config.llm.timeout
+    )
+
+
 def _make_groq_client() -> Optional[OpenAI]:
     """
     Create Groq OpenAI-compatible client with round-robin key rotation.
@@ -223,13 +264,71 @@ def _make_hf_client() -> Optional[OpenAI]:
     )
 
 
+def _chat_with_deepinfra(
+    messages: list[dict[str, Any]],
+    max_tokens: int,
+    model: Optional[str] = None
+) -> ChatResult:
+    """
+    Chat using DeepInfra (PRIMARY backend).
+    Same GPT-OSS 20B model at 54% lower cost, 200 concurrent requests.
+    Returns ChatResult with token usage and cost.
+    """
+    config = get_config()
+    client = _make_deepinfra_client()
+
+    if not client:
+        raise RuntimeError("DeepInfra API key not configured (set DEEPINFRA_API_KEY in .env)")
+
+    models = [model] if model else config.llm.deepinfra_models
+    last_error: Optional[Exception] = None
+
+    for model_name in models:
+        try:
+            logger.debug("Trying DeepInfra model: %s", model_name)
+
+            effective_max_tokens = max_tokens
+            if _is_reasoning_model(model_name):
+                effective_max_tokens = max_tokens + config.llm.gpt_oss_reasoning_overhead
+
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                max_tokens=effective_max_tokens,
+            )
+            if resp.choices and resp.choices[0].message:
+                content = resp.choices[0].message.content
+                if content:
+                    logger.info("Successfully used DeepInfra model: %s", model_name)
+                    usage = resp.usage
+                    prompt_tokens = usage.prompt_tokens if usage else 0
+                    completion_tokens = usage.completion_tokens if usage else 0
+                    cost = _calculate_cost(model_name, prompt_tokens, completion_tokens, backend="deepinfra")
+                    return ChatResult(
+                        content=content,
+                        model=model_name,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=prompt_tokens + completion_tokens,
+                        cost_usd=cost,
+                        backend="deepinfra",
+                    )
+            raise RuntimeError(f"Empty response from DeepInfra model {model_name}")
+        except Exception as e:
+            last_error = e
+            logger.warning("DeepInfra model %s failed: %s", model_name, str(e)[:100])
+            continue
+
+    raise last_error or RuntimeError("All DeepInfra models failed")
+
+
 def _chat_with_groq(
     messages: list[dict[str, Any]],
     max_tokens: int,
     model: Optional[str] = None
 ) -> ChatResult:
     """
-    Chat using Groq with automatic model fallback.
+    Chat using Groq with automatic model fallback (FALLBACK backend).
     Handles GPT-OSS reasoning models by adding token overhead
     and extracting content from reasoning responses.
     Returns ChatResult with token usage and cost.
@@ -266,7 +365,7 @@ def _chat_with_groq(
                     usage = resp.usage
                     prompt_tokens = usage.prompt_tokens if usage else 0
                     completion_tokens = usage.completion_tokens if usage else 0
-                    cost = _calculate_cost(model_name, prompt_tokens, completion_tokens)
+                    cost = _calculate_cost(model_name, prompt_tokens, completion_tokens, backend="groq")
                     return ChatResult(
                         content=content,
                         model=model_name,
@@ -386,6 +485,17 @@ def _chat_with_hf(
 
 
 @retry_with_jitter(max_retries=2, base_delay=0.5, max_delay=5.0)
+def _deepinfra_with_retry(
+    messages: list[dict[str, Any]],
+    max_tokens: int,
+    model: Optional[str] = None
+) -> ChatResult:
+    """DeepInfra chat with retry and circuit breaker."""
+    breaker = _get_deepinfra_circuit_breaker()
+    return breaker.execute(_chat_with_deepinfra, messages, max_tokens, model)
+
+
+@retry_with_jitter(max_retries=2, base_delay=0.5, max_delay=5.0)
 def _groq_with_retry(
     messages: list[dict[str, Any]],
     max_tokens: int,
@@ -433,26 +543,30 @@ def _chat_internal(
     config = get_config()
     max_tokens = max_tokens or config.llm.max_tokens_default
 
-    # Build fallback chain: Groq (fastest) -> Ollama (local) -> HuggingFace (backup)
+    # Build fallback chain: DeepInfra (cheapest) -> Groq (fast) -> Ollama (local) -> HuggingFace (backup)
     if prefer_local:
         handlers = [
             (lambda m=messages, t=max_tokens, mod=model: _ollama_with_retry(m, t, mod), "Ollama"),
+            (lambda m=messages, t=max_tokens, mod=model: _deepinfra_with_retry(m, t, mod), "DeepInfra"),
             (lambda m=messages, t=max_tokens, mod=model: _groq_with_retry(m, t, mod), "Groq"),
             (lambda m=messages, t=max_tokens, mod=model: _hf_with_retry(m, t, mod), "HuggingFace"),
         ]
     else:
-        # Check if Groq is configured, otherwise start with Ollama
+        handlers = []
+        if config.llm.deepinfra_api_key:
+            handlers.append(
+                (lambda m=messages, t=max_tokens, mod=model: _deepinfra_with_retry(m, t, mod), "DeepInfra")
+            )
         if config.llm.groq_api_key:
-            handlers = [
-                (lambda m=messages, t=max_tokens, mod=model: _groq_with_retry(m, t, mod), "Groq"),
-                (lambda m=messages, t=max_tokens, mod=model: _ollama_with_retry(m, t, mod), "Ollama"),
-                (lambda m=messages, t=max_tokens, mod=model: _hf_with_retry(m, t, mod), "HuggingFace"),
-            ]
-        else:
-            handlers = [
-                (lambda m=messages, t=max_tokens, mod=model: _ollama_with_retry(m, t, mod), "Ollama"),
-                (lambda m=messages, t=max_tokens, mod=model: _hf_with_retry(m, t, mod), "HuggingFace"),
-            ]
+            handlers.append(
+                (lambda m=messages, t=max_tokens, mod=model: _groq_with_retry(m, t, mod), "Groq")
+            )
+        handlers.append(
+            (lambda m=messages, t=max_tokens, mod=model: _ollama_with_retry(m, t, mod), "Ollama")
+        )
+        handlers.append(
+            (lambda m=messages, t=max_tokens, mod=model: _hf_with_retry(m, t, mod), "HuggingFace")
+        )
 
     degradation = GracefulDegradation(handlers)
 
@@ -467,13 +581,13 @@ def _chat_internal(
         logger.error("All circuit breakers open: %s", e)
         raise RuntimeError(
             "LLM service temporarily unavailable. "
-            "Set GROQ_API_KEY (fastest), ensure Ollama is running, or set HF_TOKEN."
+            "Set DEEPINFRA_API_KEY (cheapest) or GROQ_API_KEY, ensure Ollama is running, or set HF_TOKEN."
         ) from e
     except Exception as e:
         logger.error("All LLM backends failed: %s", e)
         raise RuntimeError(
             "LLM request failed. "
-            "Set GROQ_API_KEY for best speed, or check Ollama status (ollama list)."
+            "Set DEEPINFRA_API_KEY (cheapest) or GROQ_API_KEY, or check Ollama status."
         ) from e
 
 
@@ -553,25 +667,50 @@ def health_check() -> dict[str, Any]:
     """
     config = get_config()
     num_groq_keys = len(config.llm.groq_api_keys)
+    has_deepinfra = config.llm.deepinfra_api_key is not None
     status = {
+        "deepinfra": {
+            "available": False,
+            "configured": has_deepinfra,
+            "primary_model": config.llm.deepinfra_models[0] if config.llm.deepinfra_models else None,
+            "models": [],
+            "error": None,
+            "role": "primary",
+        },
         "groq": {
             "available": False,
             "configured": num_groq_keys > 0,
             "num_keys": num_groq_keys,
             "primary_model": config.llm.groq_models[0] if config.llm.groq_models else None,
             "models": [],
-            "error": None
+            "error": None,
+            "role": "fallback",
         },
         "ollama": {"available": False, "models": [], "error": None},
         "huggingface": {"available": False, "configured": False, "error": None}
     }
 
-    # Check Groq (fastest option)
+    # Check DeepInfra (primary - cheapest)
+    if has_deepinfra:
+        try:
+            client = _make_deepinfra_client()
+            if client:
+                resp = client.chat.completions.create(
+                    model="openai/gpt-oss-20b",
+                    messages=[{"role": "user", "content": "Hi"}],
+                    max_tokens=5,
+                )
+                if resp.choices:
+                    status["deepinfra"]["available"] = True
+                    status["deepinfra"]["models"] = config.llm.deepinfra_models
+        except Exception as e:
+            status["deepinfra"]["error"] = str(e)[:200]
+
+    # Check Groq (fallback)
     if num_groq_keys > 0:
         try:
             client = _make_groq_client()
             if client:
-                # Try a simple completion to verify (use non-reasoning model for health check)
                 resp = client.chat.completions.create(
                     model="llama-3.1-8b-instant",
                     messages=[{"role": "user", "content": "Hi"}],
@@ -612,7 +751,9 @@ def health_check() -> dict[str, Any]:
 
 def reset_circuit_breakers() -> None:
     """Reset all circuit breakers (useful for testing or recovery)."""
-    global _groq_circuit_breaker, _ollama_circuit_breaker, _hf_circuit_breaker
+    global _deepinfra_circuit_breaker, _groq_circuit_breaker, _ollama_circuit_breaker, _hf_circuit_breaker
+    if _deepinfra_circuit_breaker:
+        _deepinfra_circuit_breaker.reset()
     if _groq_circuit_breaker:
         _groq_circuit_breaker.reset()
     if _ollama_circuit_breaker:
